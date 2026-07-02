@@ -319,7 +319,7 @@ pub fn respond_nk(
         .derive_dh_secret(in_message.ephemeral_public_key.as_slice())
         .map_err(|_| Error::InvalidHandshake)?;
     noise.mix_key(es_ecdh_bytes.as_slice());
-    finish_response(&mut noise, in_message)
+    finish_response(&mut noise, in_message, None)
 }
 
 pub fn respond_nn(in_message: &NoiseMessage) -> Result<Response, Error> {
@@ -328,7 +328,7 @@ pub fn respond_nn(in_message: &NoiseMessage) -> Result<Response, Error> {
 
     noise.mix_hash(in_message.ephemeral_public_key.as_slice());
     noise.mix_key(in_message.ephemeral_public_key.as_slice());
-    finish_response(&mut noise, in_message)
+    finish_response(&mut noise, in_message, None)
 }
 
 pub fn respond_kk(
@@ -365,14 +365,18 @@ pub fn respond_kk(
         .map_err(|_| Error::InvalidHandshake)?;
     noise.mix_key(&ss_ecdh_bytes);
 
-    let se_ecdh_bytes = identity_priv
-        .derive_dh_secret(initiator_static_pub_bytes.as_slice())
-        .map_err(|_| Error::InvalidHandshake)?;
-    noise.mix_key(&se_ecdh_bytes);
-    finish_response(&mut noise, in_message)
+    // The `se` DH term (DH(s_initiator, e_responder)) belongs to the second
+    // message (<- e, ee, se) and requires the responder's ephemeral key, which
+    // is generated in `finish_response`.  Pass the initiator's static public
+    // key through so `se` can be computed there in the correct order.
+    finish_response(&mut noise, in_message, Some(&initiator_static_pub_bytes))
 }
 
-fn finish_response(noise: &mut Noise, in_message: &NoiseMessage) -> Result<Response, Error> {
+fn finish_response(
+    noise: &mut Noise,
+    in_message: &NoiseMessage,
+    initiator_static_pub: Option<&[u8; P256_X962_LEN]>,
+) -> Result<Response, Error> {
     let plaintext = noise.decrypt_and_hash(&in_message.ciphertext)?;
     if !plaintext.is_empty() {
         return Err(Error::InvalidHandshake);
@@ -393,6 +397,20 @@ fn finish_response(noise: &mut Noise, in_message: &NoiseMessage) -> Result<Respo
     )
     .map_err(|_| Error::InvalidHandshake)?;
     noise.mix_key(ee_ecdh_bytes.as_slice());
+
+    // se: DH(s_initiator, e_responder) — only present in the KK pattern
+    // (<- e, ee, se).  This is the responder's forward-secrecy contribution:
+    // it binds the initiator's *static* key to the responder's *ephemeral*
+    // key, so recovering it requires the responder's ephemeral private key
+    // (discarded after the handshake) even if the initiator's static key is
+    // later compromised.  Computed from the responder side as
+    // DH(e_responder_priv, s_initiator_pub).
+    if let Some(initiator_static_pub) = initiator_static_pub {
+        let se_ecdh_bytes =
+            crypto_wrapper::p256_scalar_mult(&ephemeral_priv, initiator_static_pub)
+                .map_err(|_| Error::InvalidHandshake)?;
+        noise.mix_key(se_ecdh_bytes.as_slice());
+    }
 
     let response_ciphertext = noise.encrypt_and_hash(&[]);
 
